@@ -1,0 +1,550 @@
+type: "orchestration"
+version: "1.0"
+pipeline:
+  metadata:
+    description: "Multi-Server Incremental Extract & Load Pipeline. Extracts data\
+      \ from       multiple SQL Server instances in parallel using LSET/CET watermarking,\
+      \ stages       into Snowflake, merges into target with dedup, and sends conditional\
+      \ email       notifications based on explicit failure capture."
+    origin: "maia-37752454-bfb9-4018-a158-74729f2229da"
+  components:
+    Start:
+      type: "start"
+      transitions:
+        unconditional:
+        - "Get LSET"
+      parameters:
+        componentName: "Start"
+    Get LSET:
+      type: "sql-executor"
+      transitions:
+        success:
+        - "Truncate Staging"
+      parameters:
+        componentName: "Get LSET"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Read per-server watermarks from control table
+          SET v_lset_server_a = (
+            SELECT COALESCE(
+              (SELECT TO_VARCHAR("LAST_SUCCESS_TIMESTAMP", 'YYYY-MM-DD HH24:MI:SS.FF3')
+               FROM "${v_database}"."ETL"."CONTROL_TABLE"
+               WHERE "PIPELINE_NAME" = '${v_pipeline_name}'
+                 AND "SOURCE_KEY" = 'SERVER_A'),
+              '1900-01-01 00:00:00.000'
+            )
+          );
+          SET v_lset_server_b = (
+            SELECT COALESCE(
+              (SELECT TO_VARCHAR("LAST_SUCCESS_TIMESTAMP", 'YYYY-MM-DD HH24:MI:SS.FF3')
+               FROM "${v_database}"."ETL"."CONTROL_TABLE"
+               WHERE "PIPELINE_NAME" = '${v_pipeline_name}'
+                 AND "SOURCE_KEY" = 'SERVER_B'),
+              '1900-01-01 00:00:00.000'
+            )
+          );
+          SET v_lset_server_c = (
+            SELECT COALESCE(
+              (SELECT TO_VARCHAR("LAST_SUCCESS_TIMESTAMP", 'YYYY-MM-DD HH24:MI:SS.FF3')
+               FROM "${v_database}"."ETL"."CONTROL_TABLE"
+               WHERE "PIPELINE_NAME" = '${v_pipeline_name}'
+                 AND "SOURCE_KEY" = 'SERVER_C'),
+              '1900-01-01 00:00:00.000'
+            )
+          );
+        declareSqlVariables: "Include selected"
+        variablesToInclude:
+        - "v_lset_server_a"
+        - "v_lset_server_b"
+        - "v_lset_server_c"
+        - "v_pipeline_name"
+    Truncate Staging:
+      type: "sql-executor"
+      transitions:
+        success:
+        - "Reset Failure Log"
+      parameters:
+        componentName: "Truncate Staging"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          TRUNCATE TABLE "${v_database}"."ETL"."EXTRACT_STAGE";
+    Reset Failure Log:
+      type: "sql-executor"
+      transitions:
+        success:
+        - "Load Server A"
+        - "Load Server B"
+        - "Load Server C"
+      parameters:
+        componentName: "Reset Failure Log"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          CREATE OR REPLACE TABLE "${v_database}"."ETL"."FAILURE_LOG" (
+            "SOURCE_KEY" STRING,
+            "SOURCE_NAME" STRING,
+            "FAILED_AT" TIMESTAMP
+          );
+    Load Server A:
+      type: "modular-microsoft-sql-input-v2"
+      transitions:
+        failure:
+        - "Record Server A Failure"
+        unconditional:
+        - "And"
+      parameters:
+        componentName: "Load Server A"
+        inputId: "microsoft-sql-input-v2"
+        microsoft-sql-input-v2:
+          connection:
+            overrides:
+              authType: "USERNAME_PASSWORD"
+              username: "${v_sql_username_a}"
+              password: "${v_sql_password_a}"
+              url: "jdbc:sqlserver://${v_server_ip_a};databaseName=msdb;encrypt=true;trustServerCertificate=true"
+          mode: "ADVANCED"
+          sqlQuery: |
+            SELECT
+              CONVERT(DATETIME,
+                CAST(h.run_date AS VARCHAR(8)) + ' ' +
+                STUFF(STUFF(RIGHT('000000' + CAST(h.run_time AS VARCHAR(6)), 6), 3, 0, ':'), 6, 0, ':')
+              ) AS RUN_DATETIME,
+              h.step_id AS STEP_ID,
+              '${v_source_name_a}' AS SOURCE_SERVER,
+              CAST(j.job_id AS VARCHAR(128)) AS JOB_ID,
+              CAST(j.name AS VARCHAR(128)) AS JOB_NAME,
+              CAST(h.step_name AS VARCHAR(128)) AS STEP_NAME,
+              CASE h.run_status
+                WHEN 0 THEN 'Failed'
+                WHEN 1 THEN 'Succeeded'
+                WHEN 2 THEN 'Retry'
+                WHEN 3 THEN 'Canceled'
+                WHEN 4 THEN 'In Progress'
+                ELSE 'Unknown'
+              END AS EXEC_STATUS,
+              CAST(h.message AS VARCHAR(4000)) AS MESSAGE,
+              h.run_duration AS DURATION_SECONDS,
+              GETDATE() AS EXTRACTED_AT
+            FROM msdb.dbo.sysjobhistory h
+            INNER JOIN msdb.dbo.sysjobs j ON h.job_id = j.job_id
+            WHERE CONVERT(VARCHAR(23),
+              CONVERT(DATETIME,
+                CAST(h.run_date AS VARCHAR(8)) + ' ' +
+                STUFF(STUFF(RIGHT('000000' + CAST(h.run_time AS VARCHAR(6)), 6), 3, 0, ':'), 6, 0, ':')
+              ), 121) > '${v_lset_server_a}'
+        outputId: "snowflake-output-connector-v0"
+        snowflake-output-connector-v0:
+          warehouse: "[Environment Default]"
+          database: "${v_database}"
+          schema: "ETL"
+          tableName: "EXTRACT_STAGE"
+          createTableMode: "APPEND"
+          cleanStagedFiles: "Yes"
+          stagePlatform: "SNOWFLAKE"
+          snowflake#internalStageType: "USER"
+        dataLoading:
+          loadType: "FULL_LOAD"
+    Load Server B:
+      type: "modular-microsoft-sql-input-v2"
+      transitions:
+        failure:
+        - "Record Server B Failure"
+        unconditional:
+        - "And"
+      parameters:
+        componentName: "Load Server B"
+        inputId: "microsoft-sql-input-v2"
+        microsoft-sql-input-v2:
+          connection:
+            overrides:
+              authType: "USERNAME_PASSWORD"
+              username: "${v_sql_username_b}"
+              password: "${v_sql_password_b}"
+              url: "jdbc:sqlserver://${v_server_ip_b};databaseName=msdb;encrypt=true;trustServerCertificate=true"
+          mode: "ADVANCED"
+          sqlQuery: |
+            SELECT
+              CONVERT(DATETIME,
+                CAST(h.run_date AS VARCHAR(8)) + ' ' +
+                STUFF(STUFF(RIGHT('000000' + CAST(h.run_time AS VARCHAR(6)), 6), 3, 0, ':'), 6, 0, ':')
+              ) AS RUN_DATETIME,
+              h.step_id AS STEP_ID,
+              '${v_source_name_b}' AS SOURCE_SERVER,
+              CAST(j.job_id AS VARCHAR(128)) AS JOB_ID,
+              CAST(j.name AS VARCHAR(128)) AS JOB_NAME,
+              CAST(h.step_name AS VARCHAR(128)) AS STEP_NAME,
+              CASE h.run_status
+                WHEN 0 THEN 'Failed'
+                WHEN 1 THEN 'Succeeded'
+                WHEN 2 THEN 'Retry'
+                WHEN 3 THEN 'Canceled'
+                WHEN 4 THEN 'In Progress'
+                ELSE 'Unknown'
+              END AS EXEC_STATUS,
+              CAST(h.message AS VARCHAR(4000)) AS MESSAGE,
+              h.run_duration AS DURATION_SECONDS,
+              GETDATE() AS EXTRACTED_AT
+            FROM msdb.dbo.sysjobhistory h
+            INNER JOIN msdb.dbo.sysjobs j ON h.job_id = j.job_id
+            WHERE CONVERT(VARCHAR(23),
+              CONVERT(DATETIME,
+                CAST(h.run_date AS VARCHAR(8)) + ' ' +
+                STUFF(STUFF(RIGHT('000000' + CAST(h.run_time AS VARCHAR(6)), 6), 3, 0, ':'), 6, 0, ':')
+              ), 121) > '${v_lset_server_b}'
+          connectionOptions:
+          - parameter: "trustServerCertificate"
+            value: "true"
+        outputId: "snowflake-output-connector-v0"
+        snowflake-output-connector-v0:
+          warehouse: "[Environment Default]"
+          database: "${v_database}"
+          schema: "ETL"
+          tableName: "EXTRACT_STAGE"
+          createTableMode: "APPEND"
+          cleanStagedFiles: "Yes"
+          stagePlatform: "SNOWFLAKE"
+          snowflake#internalStageType: "USER"
+        dataLoading:
+          loadType: "FULL_LOAD"
+    Load Server C:
+      type: "modular-microsoft-sql-input-v2"
+      transitions:
+        failure:
+        - "Record Server C Failure"
+        unconditional:
+        - "And"
+      parameters:
+        componentName: "Load Server C"
+        inputId: "microsoft-sql-input-v2"
+        microsoft-sql-input-v2:
+          connection:
+            overrides:
+              authType: "USERNAME_PASSWORD"
+              username: "${v_sql_username_c}"
+              password: "${v_sql_password_c}"
+              url: "jdbc:sqlserver://${v_server_ip_c};databaseName=msdb;encrypt=true;trustServerCertificate=true"
+          mode: "ADVANCED"
+          sqlQuery: |
+            SELECT
+              CONVERT(DATETIME,
+                CAST(h.run_date AS VARCHAR(8)) + ' ' +
+                STUFF(STUFF(RIGHT('000000' + CAST(h.run_time AS VARCHAR(6)), 6), 3, 0, ':'), 6, 0, ':')
+              ) AS RUN_DATETIME,
+              h.step_id AS STEP_ID,
+              '${v_source_name_c}' AS SOURCE_SERVER,
+              CAST(j.job_id AS VARCHAR(128)) AS JOB_ID,
+              CAST(j.name AS VARCHAR(128)) AS JOB_NAME,
+              CAST(h.step_name AS VARCHAR(128)) AS STEP_NAME,
+              CASE h.run_status
+                WHEN 0 THEN 'Failed'
+                WHEN 1 THEN 'Succeeded'
+                WHEN 2 THEN 'Retry'
+                WHEN 3 THEN 'Canceled'
+                WHEN 4 THEN 'In Progress'
+                ELSE 'Unknown'
+              END AS EXEC_STATUS,
+              CAST(h.message AS VARCHAR(4000)) AS MESSAGE,
+              h.run_duration AS DURATION_SECONDS,
+              GETDATE() AS EXTRACTED_AT
+            FROM msdb.dbo.sysjobhistory h
+            INNER JOIN msdb.dbo.sysjobs j ON h.job_id = j.job_id
+            WHERE CONVERT(VARCHAR(23),
+              CONVERT(DATETIME,
+                CAST(h.run_date AS VARCHAR(8)) + ' ' +
+                STUFF(STUFF(RIGHT('000000' + CAST(h.run_time AS VARCHAR(6)), 6), 3, 0, ':'), 6, 0, ':')
+              ), 121) > '${v_lset_server_c}'
+          connectionOptions:
+          - parameter: "trustServerCertificate"
+            value: "TRUE"
+        outputId: "snowflake-output-connector-v0"
+        snowflake-output-connector-v0:
+          warehouse: "[Environment Default]"
+          database: "${v_database}"
+          schema: "ETL"
+          tableName: "EXTRACT_STAGE"
+          createTableMode: "APPEND"
+          cleanStagedFiles: "Yes"
+          stagePlatform: "SNOWFLAKE"
+          snowflake#internalStageType: "USER"
+        dataLoading:
+          loadType: "FULL_LOAD"
+    Record Server A Failure:
+      type: "sql-executor"
+      parameters:
+        componentName: "Record Server A Failure"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          INSERT INTO "${v_database}"."ETL"."FAILURE_LOG" ("SOURCE_KEY", "SOURCE_NAME", "FAILED_AT")
+          SELECT 'SERVER_A', '${v_source_name_a}', CURRENT_TIMESTAMP();
+    Record Server B Failure:
+      type: "sql-executor"
+      parameters:
+        componentName: "Record Server B Failure"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          INSERT INTO "${v_database}"."ETL"."FAILURE_LOG" ("SOURCE_KEY", "SOURCE_NAME", "FAILED_AT")
+          SELECT 'SERVER_B', '${v_source_name_b}', CURRENT_TIMESTAMP();
+    Record Server C Failure:
+      type: "sql-executor"
+      parameters:
+        componentName: "Record Server C Failure"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          INSERT INTO "${v_database}"."ETL"."FAILURE_LOG" ("SOURCE_KEY", "SOURCE_NAME", "FAILED_AT")
+          SELECT 'SERVER_C', '${v_source_name_c}', CURRENT_TIMESTAMP();
+    And:
+      type: "and"
+      transitions:
+        unconditional:
+        - "Merge to Target"
+      parameters:
+        componentName: "And"
+    Merge to Target:
+      type: "sql-executor"
+      transitions:
+        success:
+        - "Update Watermarks"
+      parameters:
+        componentName: "Merge to Target"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Deduplicated merge into final target table
+          MERGE INTO "${v_database}"."ETL"."JOB_RUN_HISTORY" AS tgt
+          USING "${v_database}"."ETL"."EXTRACT_STAGE" AS src
+          ON tgt."RUN_DATETIME" = src."RUN_DATETIME"
+            AND tgt."SOURCE_SERVER" = src."SOURCE_SERVER"
+            AND tgt."JOB_ID" = src."JOB_ID"
+            AND tgt."STEP_ID" = src."STEP_ID"
+          WHEN NOT MATCHED THEN INSERT (
+            "RUN_DATETIME", "STEP_ID", "SOURCE_SERVER", "JOB_ID",
+            "JOB_NAME", "STEP_NAME", "EXEC_STATUS", "MESSAGE",
+            "DURATION_SECONDS", "EXTRACTED_AT"
+          ) VALUES (
+            src."RUN_DATETIME", src."STEP_ID", src."SOURCE_SERVER", src."JOB_ID",
+            src."JOB_NAME", src."STEP_NAME", src."EXEC_STATUS", src."MESSAGE",
+            src."DURATION_SECONDS", src."EXTRACTED_AT"
+          );
+    Update Watermarks:
+      type: "sql-executor"
+      transitions:
+        success:
+        - "Check For Failures"
+      parameters:
+        componentName: "Update Watermarks"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Only advance watermark for servers that loaded rows
+          MERGE INTO "${v_database}"."ETL"."CONTROL_TABLE" AS tgt
+          USING (
+            SELECT '${v_pipeline_name}' AS PIPELINE_NAME, 'SERVER_A' AS SOURCE_KEY, CURRENT_TIMESTAMP() AS LAST_SUCCESS_TIMESTAMP
+            FROM "${v_database}"."ETL"."EXTRACT_STAGE"
+            WHERE "SOURCE_SERVER" = '${v_source_name_a}'
+            HAVING COUNT(*) > 0
+          ) AS src
+          ON tgt."PIPELINE_NAME" = src.PIPELINE_NAME AND tgt."SOURCE_KEY" = src.SOURCE_KEY
+          WHEN MATCHED THEN UPDATE SET tgt."LAST_SUCCESS_TIMESTAMP" = src.LAST_SUCCESS_TIMESTAMP
+          WHEN NOT MATCHED THEN INSERT ("PIPELINE_NAME", "SOURCE_KEY", "LAST_SUCCESS_TIMESTAMP")
+            VALUES (src.PIPELINE_NAME, src.SOURCE_KEY, src.LAST_SUCCESS_TIMESTAMP);
+
+          MERGE INTO "${v_database}"."ETL"."CONTROL_TABLE" AS tgt
+          USING (
+            SELECT '${v_pipeline_name}' AS PIPELINE_NAME, 'SERVER_B' AS SOURCE_KEY, CURRENT_TIMESTAMP() AS LAST_SUCCESS_TIMESTAMP
+            FROM "${v_database}"."ETL"."EXTRACT_STAGE"
+            WHERE "SOURCE_SERVER" = '${v_source_name_b}'
+            HAVING COUNT(*) > 0
+          ) AS src
+          ON tgt."PIPELINE_NAME" = src.PIPELINE_NAME AND tgt."SOURCE_KEY" = src.SOURCE_KEY
+          WHEN MATCHED THEN UPDATE SET tgt."LAST_SUCCESS_TIMESTAMP" = src.LAST_SUCCESS_TIMESTAMP
+          WHEN NOT MATCHED THEN INSERT ("PIPELINE_NAME", "SOURCE_KEY", "LAST_SUCCESS_TIMESTAMP")
+            VALUES (src.PIPELINE_NAME, src.SOURCE_KEY, src.LAST_SUCCESS_TIMESTAMP);
+
+          MERGE INTO "${v_database}"."ETL"."CONTROL_TABLE" AS tgt
+          USING (
+            SELECT '${v_pipeline_name}' AS PIPELINE_NAME, 'SERVER_C' AS SOURCE_KEY, CURRENT_TIMESTAMP() AS LAST_SUCCESS_TIMESTAMP
+            FROM "${v_database}"."ETL"."EXTRACT_STAGE"
+            WHERE "SOURCE_SERVER" = '${v_source_name_c}'
+            HAVING COUNT(*) > 0
+          ) AS src
+          ON tgt."PIPELINE_NAME" = src.PIPELINE_NAME AND tgt."SOURCE_KEY" = src.SOURCE_KEY
+          WHEN MATCHED THEN UPDATE SET tgt."LAST_SUCCESS_TIMESTAMP" = src.LAST_SUCCESS_TIMESTAMP
+          WHEN NOT MATCHED THEN INSERT ("PIPELINE_NAME", "SOURCE_KEY", "LAST_SUCCESS_TIMESTAMP")
+            VALUES (src.PIPELINE_NAME, src.SOURCE_KEY, src.LAST_SUCCESS_TIMESTAMP);
+        declareSqlVariables: "Include selected"
+        variablesToInclude:
+        - "v_pipeline_name"
+    Check For Failures:
+      type: "sql-executor"
+      transitions:
+        success:
+        - "Send Success Email"
+        failure:
+        - "Send Failure Email"
+      parameters:
+        componentName: "Check For Failures"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Forces error if any server failed (division by zero)
+          -- Success path = all servers OK, Failure path = at least one failed
+          SET v_check = (SELECT CASE WHEN COUNT(*) > 0 THEN 1/0 ELSE 1 END FROM "${v_database}"."ETL"."FAILURE_LOG");
+    Send Success Email:
+      type: "send-email-v2"
+      parameters:
+        componentName: "Send Success Email"
+        toRecipients:
+        - "${v_email_recipients}"
+        subject: "Multi-Server Extract - SUCCESS"
+        message: |-
+          Multi-Server Extract Loader completed SUCCESSFULLY.
+
+          All sources loaded without errors. Data merged into target table.
+
+          Pipeline: ${v_pipeline_name}
+        senderAddress: "noreply@company.com"
+        smtpUsername: "noreply@company.com"
+        smtpPassword: "smtp-secret"
+        smtpHostname: "${v_smtp_hostname}"
+        smtpPort: "25"
+        enableSslTls: "No"
+        enableStartTls: "No"
+    Send Failure Email:
+      type: "send-email-v2"
+      parameters:
+        componentName: "Send Failure Email"
+        toRecipients:
+        - "${v_email_recipients}"
+        subject: "Multi-Server Extract - PARTIAL FAILURE"
+        message: |-
+          Multi-Server Extract Loader completed with ERRORS.
+
+          One or more source servers failed during extraction.
+          Data from successful servers was still loaded.
+
+          Please check the task run history for details.
+
+          Pipeline: ${v_pipeline_name}
+        senderAddress: "noreply@company.com"
+        smtpUsername: "noreply@company.com"
+        smtpPassword: "smtp-secret"
+        smtpHostname: "${v_smtp_hostname}"
+        smtpPort: "25"
+        enableSslTls: "No"
+        enableStartTls: "No"
+  variables:
+    v_pipeline_name:
+      metadata:
+        type: "TEXT"
+        description: "Pipeline identifier for control table lookups"
+        scope: "COPIED"
+        visibility: "PRIVATE"
+      defaultValue: "Multi_Server_Extract_Loader"
+    v_lset_server_a:
+      metadata:
+        type: "TEXT"
+        description: "Last successful extraction timestamp for Server A"
+        scope: "COPIED"
+        visibility: "PRIVATE"
+      defaultValue: "1900-01-01 00:00:00.000"
+    v_lset_server_b:
+      metadata:
+        type: "TEXT"
+        description: "Last successful extraction timestamp for Server B"
+        scope: "COPIED"
+        visibility: "PRIVATE"
+      defaultValue: "1900-01-01 00:00:00.000"
+    v_lset_server_c:
+      metadata:
+        type: "TEXT"
+        description: "Last successful extraction timestamp for Server C"
+        scope: "COPIED"
+        visibility: "PRIVATE"
+      defaultValue: "1900-01-01 00:00:00.000"
+design:
+  components:
+    Start:
+      position:
+        x: 0
+        "y": 0
+      tempMetlId:
+    Get LSET:
+      position:
+        x: 200
+        "y": 0
+      tempMetlId:
+    Truncate Staging:
+      position:
+        x: 400
+        "y": 0
+      tempMetlId:
+    Reset Failure Log:
+      position:
+        x: 600
+        "y": 0
+      tempMetlId:
+    Load Server A:
+      position:
+        x: 800
+        "y": -120
+      tempMetlId:
+    Load Server B:
+      position:
+        x: 800
+        "y": 0
+      tempMetlId:
+    Load Server C:
+      position:
+        x: 800
+        "y": 120
+      tempMetlId:
+    Record Server A Failure:
+      position:
+        x: 1000
+        "y": -200
+      tempMetlId:
+    Record Server B Failure:
+      position:
+        x: 1000
+        "y": -60
+      tempMetlId:
+    Record Server C Failure:
+      position:
+        x: 1000
+        "y": 200
+      tempMetlId:
+    And:
+      position:
+        x: 1200
+        "y": 0
+      tempMetlId:
+    Merge to Target:
+      position:
+        x: 1400
+        "y": 0
+      tempMetlId:
+    Update Watermarks:
+      position:
+        x: 1600
+        "y": 0
+      tempMetlId:
+    Check For Failures:
+      position:
+        x: 1800
+        "y": 0
+      tempMetlId:
+    Send Success Email:
+      position:
+        x: 2000
+        "y": 80
+      tempMetlId:
+    Send Failure Email:
+      position:
+        x: 2000
+        "y": -80
+      tempMetlId:

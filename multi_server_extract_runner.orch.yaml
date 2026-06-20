@@ -1,0 +1,34 @@
+type: "orchestration"
+version: "1.0"
+pipeline:
+  metadata:
+    description: "Scheduling wrapper for Multi-Server Extract Loader. Schedule this\
+      \ pipeline to trigger daily extractions."
+    origin: "maia-37752454-bfb9-4018-a158-74729f2229da"
+  components:
+    Start:
+      type: "start"
+      transitions:
+        unconditional:
+        - "Run Multi Server Extract Loader"
+      parameters:
+        componentName: "Start"
+    Run Multi Server Extract Loader:
+      type: "run-orchestration"
+      parameters:
+        componentName: "Run Multi Server Extract Loader"
+        orchestrationJob: "multi_server_extract_loader"
+        setScalarVariables:
+        setGridVariables:
+design:
+  components:
+    Start:
+      position:
+        x: 0
+        "y": 0
+      tempMetlId:
+    Run Multi Server Extract Loader:
+      position:
+        x: 160
+        "y": 0
+      tempMetlId:
